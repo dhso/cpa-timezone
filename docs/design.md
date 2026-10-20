@@ -1,0 +1,68 @@
+# codex-timezone 设计
+
+CPA 插件。在请求发往 Codex 上游之前，把请求里模型可见的日期和时区文本改成配置的时区。原理分析见 [codex-timezone-sync-principle.md](codex-timezone-sync-principle.md)，本实现只复用其原理，不含原版代码。
+
+## 范围
+
+- 只改请求体里的文本。不改 HTTP 头、工具返回、沙箱 `TZ`。
+- 只处理 `ToFormat == codex`（不区分大小写）。其他格式原样放行。
+- 时区由用户配置，不做出口 IP 探测。原版的探测器、状态文件、管理面都不在本实现内。
+
+## 挂载点
+
+能力 `request_normalizer`，方法 `request.normalize`。宿主在原生翻译之后调用（`sdk/translator/registry.go`），所以拿到的已经是 Codex 请求形态（顶层 `instructions` + `input[]`）。
+
+宿主侧约定（读 v8.0.35 源码确认）：
+
+- 响应 `Body` 为空 = 不改写，宿主继续用原请求。因此所有跳过路径都返回空 `PayloadResponse`，不返回错误。
+- 插件与宿主同进程、无沙箱。宿主的 `fusePlugin` 只覆盖宿主侧适配器的 panic，不覆盖插件自己 Go 运行时里的 panic，后者按 Go 语义会终止整个进程（未实测）。所以 `cliproxyPluginCall` 里 recover 并转成错误信封，宿主随后按错误走 fail-open。
+- `plugin.quiesce` 未实现时宿主按 `unknown_method` 降级为 debug 日志。这里仍显式返回 ok，少一条日志。
+
+## 配置
+
+`plugins.configs.codex-timezone.timezone`，IANA 名。
+
+- 选择器 = `ConfigFields` 的 `enum` 字段，`EnumValues` 取 `zones.go` 的精选列表，管理中心渲染成下拉。
+- 列表之外的合法 IANA 名可直接写 YAML，插件接受任意能被 `time.LoadLocation` 解析的名字。
+- 留空 = 不改写（插件仍注册）。
+- 名字先过 `[A-Za-z0-9_+/-]{1,80}`，因为它会写进 prompt；`Local` 被拒绝，否则会解析成宿主所在时区。
+- 嵌入 `time/tzdata`，宿主没有系统 zoneinfo（如 Windows）也能解析。
+
+**配置被拒绝时的宿主行为**：`plugin.reconfigure` 返回错误后，宿主把插件标记为未注册（`registered:false`、`effective_enabled:false`），配置文件里仍保留非法值，直到保存一个合法值才恢复。插件内部保留上一个有效时区，但宿主不会再调用它。这是在沙箱宿主里实测的结果，不是推断。
+
+## 改写规则（`rewrite.go`）
+
+日期、缩写、偏移每次请求用 tz 库按当前时刻现算，不缓存，所以跨午夜和夏令时切换都正确。
+
+扫描范围：顶层 `instructions`、`system`；`input`、`messages`（字符串，或 `role` 为 `system`/`developer`/`user` 的消息，内容为字符串或 `type` 为 `text`/`input_text` 的片段）。`assistant`、工具输出、`tools` 不碰。
+
+1. **有 `<environment_context>` 块**（大小写不敏感，可多个）：只就地改块内 `<timezone>`、`<current_date>`。有元素则替换，有自闭合则展开，没有则追加。不注入任何文本。
+2. **没有块**：按形态注入带 `[CODEX_TIMEZONE_V1]` 标记的上下文。
+
+   | 形态 | 动作 |
+   | --- | --- |
+   | `instructions` 是字符串 | 末尾追加（空串则直接替换） |
+   | `instructions` 为 `null`，或缺失且 `input` 是数组 | 设为上下文 |
+   | 缺失且 `messages` 是数组 | 头部插入 `developer` 消息 |
+   | `instructions` 是其他类型 | 不动，避免与未知指令源冲突 |
+
+3. **幂等**：任一候选字符串已含标记则不再注入；环境块已是目标值则视为无变化。无变化与跳过都返回空 Body。
+
+用 `sjson` 按路径原地改字段，其余字节（键顺序、其他字段）保持不变。
+
+## 已知限制
+
+- 模型是否采信注入文本是行为假设，没有实测数据。
+- 环境块字段集只依据原版测试夹具，未用真实 Codex 客户端验证。
+- 管理中心对 50 项 enum 的渲染效果未验证（沙箱里关了面板，只验证了 `GET /plugins` 返回 `config_fields`）。
+- `instructions` 注入依赖宿主 Codex 执行器保留非空 `instructions`；已读源码确认非 SIWC 路径只会补空串，SIWC 路径只删空串。
+- 被改写的字符串经 `sjson` 重新编码，其中的 `<`、`>`、`&` 会变成 `<` 等转义。JSON 语义不变，只有被改写字符串的字节会变，其余字段字节不变。
+- 性能（本机 arm64 实测）：4MB 请求体约 28 到 46 ms。若几百条消息都带环境块，耗时随改写次数平方增长（200 条、4MB 约 258 ms、1.6 GB 分配），因为 `sjson` 每改一处都复制整个 body。真实 Codex 通常只有少量环境块，暂不处理；需要时改成按 gjson 偏移一次性拼接。
+
+## 构建与发布
+
+- 本机：`make build` 产出 `bin/codex-timezone.<so|dylib|dll>`；`make check` = vet + test。
+- 版本：`main.version` 默认 `0.1.0`，发布时由 `-ldflags "-X main.version=<tag 去 v>"` 覆盖。宿主要求版本以数字开头且不带 `v`。
+- CI：`.github/workflows/ci.yml` 跑 `make check` + `make build`。
+- 发布：`release.yml` 在 `v*` tag 上于各原生 runner 构建（cgo 不便交叉编译），打包为 `codex-timezone_<version>_<goos>_<goarch>.zip`（库在 zip 根）并生成 `checksums.txt`，用 `gh release create` 发布。Action 均固定到提交 SHA。
+- SDK 依赖固定 `CLIProxyAPI/v8 v8.0.35`。官方示例 `go.mod` 仍写 `/v7`，但源码 import 与根模块都是 `/v8`，以后者为准。
