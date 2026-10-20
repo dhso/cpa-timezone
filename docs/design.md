@@ -65,4 +65,5 @@ CPA 插件。在请求发往 Codex 上游之前，把请求里模型可见的日
 - 版本：`main.version` 默认 `0.1.0`，发布时由 `-ldflags "-X main.version=<tag 去 v>"` 覆盖。宿主要求版本以数字开头且不带 `v`。
 - CI：`.github/workflows/ci.yml` 跑 `make check` + `make build`。
 - 发布：`release.yml` 在 `v*` tag 上于各原生 runner 构建（cgo 不便交叉编译），打包为 `codex-timezone_<version>_<goos>_<goarch>.zip`（库在 zip 根）并生成 `checksums.txt`，用 `gh release create` 发布。Action 均固定到提交 SHA。
+- 商店安装：根目录 `registry.json`（`schema_version: 1`，`github-release` 类型）是第三方商店源，用户在 `plugins.store-sources` 配置其 raw URL。宿主据 `repository` 取最新 Release，版本取自 tag，所以 registry 不写 `version`，发版无需改它。宿主要求 zip 名为 `<id>_<version>_<goos>_<goarch>.zip`、库文件名为 `<id>.<ext>` 且在 zip 根、Release 里有 `checksums.txt`（读 v8.0.35 `internal/pluginstore` 确认），`release.yml` 已按此打包。`registry.json` 的 `id` 必须等于 `pluginID`，`TestRegistryMatchesPlugin` 守护这一点。收录进官方商店需向 `router-for-me/CLIProxyAPI-Plugins-Store` 提交同样的条目，未做。
 - SDK 依赖固定 `CLIProxyAPI/v8 v8.0.35`。官方示例 `go.mod` 仍写 `/v7`，但源码 import 与根模块都是 `/v8`，以后者为准。

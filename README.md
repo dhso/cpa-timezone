@@ -4,12 +4,22 @@ CLIProxyAPI 插件。把发往 Codex 的请求里的日期和时区文本改成�
 
 ## 安装
 
-1. 从 [Releases](https://github.com/dhso/cpa-timezone/releases) 下载对应平台的 zip，解压出库文件放进 `plugins/<GOOS>/<GOARCH>/` 或 `plugins/`。宿主必须是 CGO 构建。
-2. 在 CPA 配置里启用并选择时区：
+### 从插件商店安装
+
+1. 把本仓库的 registry 加为第三方商店源（官方源始终保留）：
 
 ```yaml
 plugins:
   enabled: true
+  store-sources:
+    - "https://raw.githubusercontent.com/dhso/cpa-timezone/main/registry.json"
+```
+
+2. 在管理中心的插件商店搜索 `codex-timezone` 并安装。宿主必须是 CGO 构建。
+3. 在 CPA 配置里启用并选择时区：
+
+```yaml
+plugins:
   configs:
     codex-timezone:
       enabled: true
@@ -17,7 +27,11 @@ plugins:
       timezone: "Asia/Tokyo"
 ```
 
-3. 访问 `GET /v0/management/plugins`，确认 `registered` 和 `effective_enabled` 都是 `true`。
+4. 访问 `GET /v0/management/plugins`，确认 `registered` 和 `effective_enabled` 都是 `true`。
+
+### 手动安装
+
+从 [Releases](https://github.com/dhso/cpa-timezone/releases) 下载对应平台的 zip，解压出库文件放进 `plugins/<GOOS>/<GOARCH>/` 或 `plugins/`，其余步骤同上。
 
 ## 选择时区
 

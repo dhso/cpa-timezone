@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "codex-timezone",
+      "name": "Codex Timezone",
+      "description": "把发往 Codex 的请求里的日期和时区文本改成指定时区，让模型自报的日期与时区一致。 / Rewrites the date and timezone text in Codex requests to a configured IANA timezone.",
+      "author": "dhso",
+      "repository": "https://github.com/dhso/cpa-timezone",
+      "homepage": "https://github.com/dhso/cpa-timezone",
+      "license": "MIT",
+      "tags": ["Codex", "Timezone", "Request"]
+    }
+  ]
+}
