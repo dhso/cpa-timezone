@@ -1,5 +1,11 @@
 Third-party notices
 
+The time context recognition rules in timecontext.go (role-bound blocks, whole-text XML match,
+content_item_kinds precedence, web_search user_location) are a Go reimplementation of the logic in
+backend/crates/providers/openai/src/transport/request.rs from codex-proxy-rs
+(https://github.com/zyycn/codex-proxy-rs), which is distributed under the Apache License 2.0
+(https://www.apache.org/licenses/LICENSE-2.0). No Rust source was copied.
+
 The C ABI v1 export glue in main.go (the cgo preamble, the exported init/call/free/shutdown
 functions and the response buffer handling) follows the structure of
 examples/plugin/codex-service-tier/go/main.go from CLIProxyAPI

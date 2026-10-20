@@ -27,6 +27,7 @@ CPA 插件。在请求发往 Codex 上游之前，把请求里模型可见的日
 - 留空 = 不改写（插件仍注册）。
 - 名字先过 `[A-Za-z0-9_+/-]{1,80}`，因为它会写进 prompt；`Local` 被拒绝，否则会解析成宿主所在时区。
 - 嵌入 `time/tzdata`，宿主没有系统 zoneinfo（如 Windows）也能解析。
+- 可选 `country`（ISO 3166-1 alpha-2，写入时转大写）、`region`、`city`，只用于 `web_search` 工具的 `user_location`。Go 内嵌的 tzdata 不含 `zone.tab`，国家和地区无法由时区推出，所以不猜，只写配置了的值；`city` 留空取时区名最后一段（下划线换空格）。`region`、`city` 会进工具参数，先过 `[\p{L}\p{N} .,'()-]{1,80}`；非法值和非法时区一样让配置被拒绝。
 
 **配置被拒绝时的宿主行为**：`plugin.reconfigure` 返回错误后，宿主把插件标记为未注册（`registered:false`、`effective_enabled:false`），配置文件里仍保留非法值，直到保存一个合法值才恢复。插件内部保留上一个有效时区，但宿主不会再调用它。这是在沙箱宿主里实测的结果，不是推断。
 
@@ -34,10 +35,14 @@ CPA 插件。在请求发往 Codex 上游之前，把请求里模型可见的日
 
 日期、缩写、偏移每次请求用 tz 库按当前时刻现算，不缓存，所以跨午夜和夏令时切换都正确。
 
-扫描范围：顶层 `instructions`、`system`；`input`、`messages`（字符串，或 `role` 为 `system`/`developer`/`user` 的消息，内容为字符串或 `type` 为 `text`/`input_text` 的片段）。`assistant`、工具输出、`tools` 不碰。
+时间上下文块只在顶层 `input` 数组里识别（宿主翻译后的 Codex 请求就是这个形态）。识别规则对齐 codex-proxy-rs 的请求编码器，宁可漏改也不改到用户贴出来的示例文本。`assistant`、工具输出不碰；`tools` 只有下面的 `web_search` 一项会改。
 
-1. **有 `<environment_context>` 块**（大小写不敏感，可多个）：只就地改块内 `<timezone>`、`<current_date>`。有元素则替换，有自闭合则展开，没有则追加。不注入任何文本。
-2. **没有块**：按形态注入带 `[CODEX_TIMEZONE_V1]` 标记的上下文。
+1. **识别到时间上下文块**：只就地改块的直接子元素 `<timezone>`、`<current_date>`，块内其他元素和文字保留，缺的字段不追加，不注入任何文本。自闭合 `<timezone/>` 会展开成完整元素。识别条件（`timecontext.go`）：
+   - 角色绑定块：`user` 认 `<environment_context>`；`developer` 认 `<codex_apps_client_time_context>`。Desktop 把客户端本地时区放在独立的 developer 消息里，只改 user 消息模型会同时看到两份时区。
+   - `content` 是数组，片段 `type` 为 `input_text` 且 `text` 是字符串。
+   - 整段文本去首尾空白后恰好是一个 `<tag>…</tag>`，能被 XML 解析，根元素名一致（区分大小写）。前后夹带文字、非法 XML、同一字符串里多个块、嵌套在其他元素里的字段都不改。多个块分散在不同片段或消息里则各自识别。
+   - 消息带 `internal_chat_message_metadata_passthrough.content_item_kinds` 时它说了算：同下标的值必须等于该块的类别（`environments.environment_context` 或 `additional_content.codex_apps_client_time_context`）。显式标成 `user.text`、空数组、未知类别都不改。没带则只按角色和整块形态识别（自定义 Provider 会去掉这个标注）。
+2. **没识别到任何块**（含上述各种不改的情形）：按形态注入带 `[CODEX_TIMEZONE_V1]` 标记的上下文。
 
    | 形态 | 动作 |
    | --- | --- |
@@ -46,14 +51,17 @@ CPA 插件。在请求发往 Codex 上游之前，把请求里模型可见的日
    | 缺失且 `messages` 是数组 | 头部插入 `developer` 消息 |
    | `instructions` 是其他类型 | 不动，避免与未知指令源冲突 |
 
-3. **幂等**：任一候选字符串已含标记则不再注入；环境块已是目标值则视为无变化。无变化与跳过都返回空 Body。
+3. **`web_search` 位置**：`tools` 里 `type` 为 `web_search` 或以 `web_search_` 开头的工具，`user_location` 整体替换为 `{"type":"approximate","timezone":…}`，再加上配置了的 `country`、`region`、`city`（`city` 缺省取时区名最后一段）。整体替换，所以原请求里的旧国家、城市不会残留。其他工具不动。
+4. **幂等**：`instructions`、`system` 或 `system`/`developer`/`user` 消息的文本里已含标记则不再注入；已识别的块已是目标值、`user_location` 已是目标值则视为无变化。无变化与跳过都返回空 Body。
 
 用 `sjson` 按路径原地改字段，其余字节（键顺序、其他字段）保持不变。
 
 ## 已知限制
 
 - 模型是否采信注入文本是行为假设，没有实测数据。
-- 环境块字段集只依据原版测试夹具，未用真实 Codex 客户端验证。
+- 块的字段集、`content_item_kinds` 的取值只依据原版和 codex-proxy-rs 的测试夹具，以及用户贴出的片段，未用真实 Codex 客户端抓包验证。
+- 只扫描 `input`。块若出现在 `instructions`、`system`、`messages` 里，不会被改写，而是按"没识别到"注入标记文本，模型可能同时看到旧时区和新时区。
+- `web_search` 的 `user_location` 是否被宿主原样转发、上游是否采信，没验证；`country`、`region` 只能手填。
 - 管理中心对 50 项 enum 的渲染效果未验证（沙箱里关了面板，只验证了 `GET /plugins` 返回 `config_fields`）。
 - `instructions` 注入依赖宿主 Codex 执行器保留非空 `instructions`；已读源码确认非 SIWC 路径只会补空串，SIWC 路径只删空串。
 - 被改写的字符串经 `sjson` 重新编码，其中的 `<`、`>`、`&` 会变成 `<` 等转义。JSON 语义不变，只有被改写字符串的字节会变，其余字段字节不变。

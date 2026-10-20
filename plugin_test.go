@@ -83,6 +83,33 @@ func TestConfigureValidation(t *testing.T) {
 	}
 }
 
+func TestConfigureSearchLocation(t *testing.T) {
+	t.Cleanup(func() { current.Store(nil) })
+	if err := configure(lifecycle(t, "timezone: Asia/Tokyo\ncountry: jp\nregion: Tokyo\ncity: Shibuya\n")); err != nil {
+		t.Fatal(err)
+	}
+	loc := gjson.Parse(current.Load().at(time.Now()).userLocation)
+	if loc.Get("country").String() != "JP" || loc.Get("region").String() != "Tokyo" || loc.Get("city").String() != "Shibuya" || loc.Get("timezone").String() != "Asia/Tokyo" {
+		t.Fatalf("unexpected location: %s", loc.Raw)
+	}
+	// City falls back to the zone's last segment; country and region are never guessed.
+	if err := configure(lifecycle(t, "timezone: Asia/Ho_Chi_Minh")); err != nil {
+		t.Fatal(err)
+	}
+	loc = gjson.Parse(current.Load().at(time.Now()).userLocation)
+	if loc.Get("city").String() != "Ho Chi Minh" || loc.Get("country").Exists() || loc.Get("region").Exists() {
+		t.Fatalf("unexpected fallback location: %s", loc.Raw)
+	}
+	for _, bad := range []string{"country: JPN", "country: \"1\"", "region: \"<x>\"", "city: \"" + strings.Repeat("a", 81) + "\""} {
+		if err := configure(lifecycle(t, "timezone: Asia/Tokyo\n"+bad)); err == nil {
+			t.Fatalf("%q should be rejected", bad)
+		}
+		if z := current.Load(); z == nil || z.name != "Asia/Ho_Chi_Minh" {
+			t.Fatalf("rejected config must keep the previous zone, got %+v", z)
+		}
+	}
+}
+
 func TestRegisterDeclaresNormalizerAndTimezoneField(t *testing.T) {
 	t.Cleanup(func() { current.Store(nil) })
 	raw, err := handleMethod(pluginabi.MethodPluginRegister, lifecycle(t, "timezone: UTC"))

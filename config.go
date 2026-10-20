@@ -21,10 +21,17 @@ var zoneNameRe = regexp.MustCompile(`^[A-Za-z0-9_+/-]{1,80}$`)
 // version is overridden at release time: -ldflags "-X main.version=<tag without v>".
 var version = "0.1.0"
 
+// placeRe limits the free-text location fields; they end up in the web_search tool the model sees.
+var placeRe = regexp.MustCompile(`^[\p{L}\p{N} .,'()-]{1,80}$`)
+
+// countryRe is an ISO 3166-1 alpha-2 code.
+var countryRe = regexp.MustCompile(`^[A-Za-z]{2}$`)
+
 // zoneState is the configured target zone; nil means "not configured", which makes the plugin a no-op.
 type zoneState struct {
-	name string
-	loc  *time.Location
+	name                  string
+	loc                   *time.Location
+	country, region, city string // optional web_search user_location fields
 }
 
 var current atomic.Pointer[zoneState]
@@ -33,12 +40,30 @@ var current atomic.Pointer[zoneState]
 // so midnight and DST transitions between requests are handled by the tz database.
 type tzContext struct {
 	name, date, abbr, offset string
+	userLocation             string // raw JSON for web_search tools' user_location
 }
 
 func (z *zoneState) at(now time.Time) tzContext {
 	t := now.In(z.loc)
 	abbr, _ := t.Zone()
-	return tzContext{name: z.name, date: t.Format("2006-01-02"), abbr: abbr, offset: t.Format("-07:00")}
+	return tzContext{name: z.name, date: t.Format("2006-01-02"), abbr: abbr, offset: t.Format("-07:00"), userLocation: z.searchLocation()}
+}
+
+// searchLocation builds the user_location object. City falls back to the last zone segment (Asia/Ho_Chi_Minh
+// gives "Ho Chi Minh"); country and region are never guessed, so they are only written when configured.
+func (z *zoneState) searchLocation() string {
+	loc := map[string]string{"type": "approximate", "timezone": z.name}
+	city := z.city
+	if i := strings.LastIndex(z.name, "/"); city == "" && i >= 0 {
+		city = strings.ReplaceAll(z.name[i+1:], "_", " ")
+	}
+	for k, v := range map[string]string{"country": z.country, "region": z.region, "city": city} {
+		if v != "" {
+			loc[k] = v
+		}
+	}
+	raw, _ := json.Marshal(loc) // map[string]string cannot fail to marshal
+	return string(raw)
 }
 
 // configure parses the lifecycle request shared by plugin.register and plugin.reconfigure.
@@ -54,6 +79,9 @@ func configure(raw []byte) error {
 	}
 	var cfg struct {
 		Timezone string `yaml:"timezone"`
+		Country  string `yaml:"country"`
+		Region   string `yaml:"region"`
+		City     string `yaml:"city"`
 	}
 	if len(req.ConfigYAML) > 0 {
 		if err := yaml.Unmarshal(req.ConfigYAML, &cfg); err != nil {
@@ -73,7 +101,16 @@ func configure(raw []byte) error {
 	if err != nil {
 		return fmt.Errorf("invalid timezone %q: want an IANA name such as Asia/Shanghai", name)
 	}
-	current.Store(&zoneState{name: name, loc: loc})
+	z := &zoneState{name: name, loc: loc, country: strings.ToUpper(strings.TrimSpace(cfg.Country)), region: strings.TrimSpace(cfg.Region), city: strings.TrimSpace(cfg.City)}
+	if z.country != "" && !countryRe.MatchString(z.country) {
+		return fmt.Errorf("invalid country %q: want an ISO 3166-1 alpha-2 code such as JP", cfg.Country)
+	}
+	for field, v := range map[string]string{"region": z.region, "city": z.city} {
+		if v != "" && !placeRe.MatchString(v) {
+			return fmt.Errorf("invalid %s %q: want letters, digits, spaces and . , ' ( ) - only, up to 80 characters", field, v)
+		}
+	}
+	current.Store(z)
 	return nil
 }
 
@@ -96,6 +133,18 @@ func registration() any {
 				Type:        pluginapi.ConfigFieldTypeEnum,
 				EnumValues:  curatedZones,
 				Description: "IANA timezone written into Codex requests. Empty disables rewriting. Names outside this list can be set in the YAML directly.",
+			}, {
+				Name:        "country",
+				Type:        pluginapi.ConfigFieldTypeString,
+				Description: "Optional ISO 3166-1 alpha-2 country code (for example JP) written into web_search user_location. Empty omits it.",
+			}, {
+				Name:        "region",
+				Type:        pluginapi.ConfigFieldTypeString,
+				Description: "Optional region or state written into web_search user_location. Empty omits it.",
+			}, {
+				Name:        "city",
+				Type:        pluginapi.ConfigFieldTypeString,
+				Description: "Optional city written into web_search user_location. Empty uses the last segment of the timezone name.",
 			}},
 		},
 		Capabilities: struct {

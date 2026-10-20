@@ -1,9 +1,8 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
-	"regexp"
-	"strconv"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -13,142 +12,64 @@ import (
 // marker makes injection idempotent: a request that already carries it is left alone.
 const marker = "[CODEX_TIMEZONE_V1]"
 
-var envBlockRe = regexp.MustCompile(`(?is)(<environment_context\b[^>]*>)(.*?)(</environment_context\s*>)`)
-
-// envField is one child element of <environment_context> that the plugin owns.
-type envField struct {
-	tag   string
-	value func(tzContext) string
-	elem  *regexp.Regexp // <tag>…</tag>
-	empty *regexp.Regexp // <tag/>
-}
-
-func newEnvField(tag string, value func(tzContext) string) envField {
-	return envField{
-		tag:   tag,
-		value: value,
-		elem:  regexp.MustCompile(`(?is)(<` + tag + `\s*>)(.*?)(</` + tag + `\s*>)`),
-		empty: regexp.MustCompile(`(?i)<` + tag + `\s*/>`),
+// hasMarker reports whether a string the model reads as instructions already carries the marker.
+// Assistant output and tool results are deliberately not looked at.
+func hasMarker(root gjson.Result) bool {
+	var found bool
+	visit := func(v gjson.Result) {
+		found = found || (v.Type == gjson.String && strings.Contains(v.String(), marker))
 	}
-}
-
-var envFields = []envField{
-	newEnvField("timezone", func(c tzContext) string { return c.name }),
-	newEnvField("current_date", func(c tzContext) string { return c.date }),
-}
-
-// set makes the block content carry exactly value for this field: it replaces every
-// <tag>…</tag>, else expands <tag/>, else appends a new element.
-func (f envField) set(content, value string) (string, bool) {
-	changed := false
-	switch {
-	case f.elem.MatchString(content):
-		content = f.elem.ReplaceAllStringFunc(content, func(m string) string {
-			sub := f.elem.FindStringSubmatch(m)
-			if sub[2] == value {
-				return m
+	var walk func(v gjson.Result)
+	walk = func(v gjson.Result) {
+		if v.IsArray() {
+			for _, p := range v.Array() {
+				if t := p.Get("type").String(); t == "text" || t == "input_text" {
+					visit(p.Get("text"))
+				}
 			}
-			changed = true
-			return sub[1] + value + sub[3]
-		})
-	case f.empty.MatchString(content):
-		content = f.empty.ReplaceAllStringFunc(content, func(string) string { return "<" + f.tag + ">" + value + "</" + f.tag + ">" })
-		changed = true
-	default:
-		if content != "" && !strings.HasSuffix(content, "\n") {
-			content += "\n"
+			return
 		}
-		content += "<" + f.tag + ">" + value + "</" + f.tag + ">\n"
-		changed = true
+		visit(v)
 	}
-	return content, changed
-}
-
-// rewriteEnv fixes every <environment_context> block in text. found reports whether any block exists.
-func rewriteEnv(text string, c tzContext) (out string, found, changed bool) {
-	out = envBlockRe.ReplaceAllStringFunc(text, func(m string) string {
-		found = true
-		sub := envBlockRe.FindStringSubmatch(m)
-		content := sub[2]
-		for _, f := range envFields {
-			var ch bool
-			content, ch = f.set(content, f.value(c))
-			changed = changed || ch
-		}
-		return sub[1] + content + sub[3]
-	})
-	return out, found, changed
-}
-
-type candidate struct{ path, text string }
-
-// candidates lists the strings that may hold an environment block: system-ish prompts and
-// system/developer/user messages. Assistant output and tool results are deliberately skipped.
-func candidates(root gjson.Result) []candidate {
-	var out []candidate
 	for _, k := range []string{"instructions", "system"} {
-		out = appendContent(out, k, root.Get(k))
+		walk(root.Get(k))
 	}
 	for _, k := range []string{"input", "messages"} {
 		v := root.Get(k)
-		switch {
-		case v.Type == gjson.String:
-			out = append(out, candidate{k, v.String()})
-		case v.IsArray():
-			for i, m := range v.Array() {
-				switch m.Get("role").String() {
-				case "system", "developer", "user":
-					out = appendContent(out, k+"."+strconv.Itoa(i)+".content", m.Get("content"))
-				}
+		if !v.IsArray() {
+			visit(v)
+			continue
+		}
+		for _, m := range v.Array() {
+			switch m.Get("role").String() {
+			case "system", "developer", "user":
+				walk(m.Get("content"))
 			}
 		}
 	}
-	return out
+	return found
 }
 
-func appendContent(out []candidate, path string, v gjson.Result) []candidate {
-	if v.Type == gjson.String {
-		return append(out, candidate{path, v.String()})
-	}
-	if v.IsArray() {
-		for j, p := range v.Array() {
-			if t := p.Get("type").String(); (t == "text" || t == "input_text") && p.Get("text").Type == gjson.String {
-				out = append(out, candidate{path + "." + strconv.Itoa(j) + ".text", p.Get("text").String()})
-			}
-		}
-	}
-	return out
-}
-
-// rewrite returns the body with the target date and zone applied. changed is false when the body is
-// already correct or cannot be handled; callers then keep the original request (fail-open).
+// rewrite returns the body with the target date, zone and search location applied. changed is false when the
+// body is already correct or cannot be handled; callers then keep the original request (fail-open).
 func rewrite(body []byte, c tzContext) (out []byte, changed bool) {
 	root := gjson.ParseBytes(body)
 	if !root.IsObject() {
 		return body, false
 	}
-	out = body
-	envFound, hasMarker := false, false
-	for _, cand := range candidates(root) {
-		hasMarker = hasMarker || strings.Contains(cand.text, marker)
-		text, found, ch := rewriteEnv(cand.text, c)
-		envFound = envFound || found
-		if !ch {
-			continue
-		}
-		next, err := sjson.SetBytes(out, cand.path, text)
-		if err != nil {
-			return body, false
-		}
-		out, changed = next, true
-	}
-	if envFound {
-		return out, changed
-	}
-	if hasMarker {
+	out, found, err := alignTimeContexts(body, root, c)
+	if err != nil {
 		return body, false
 	}
-	return inject(body, root, c)
+	if !found && !hasMarker(root) {
+		if injected, ok := inject(out, gjson.ParseBytes(out), c); ok {
+			out = injected
+		}
+	}
+	if out, err = alignSearchLocation(out, gjson.ParseBytes(out), c); err != nil {
+		return body, false
+	}
+	return out, !bytes.Equal(out, body)
 }
 
 func contextText(c tzContext) string {
@@ -158,7 +79,7 @@ func contextText(c tzContext) string {
 		"Treat this as the user's local date and timezone unless they name another timezone."
 }
 
-// inject adds the context text when the request has no environment block, following the request shape.
+// inject adds the context text when the request has no recognised time context, following the request shape.
 func inject(body []byte, root gjson.Result, c tzContext) ([]byte, bool) {
 	text := contextText(c)
 	ins := root.Get("instructions")

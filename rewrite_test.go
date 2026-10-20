@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -12,7 +13,12 @@ var tokyo = tzContext{name: "Asia/Tokyo", date: "2026-10-21", abbr: "JST", offse
 
 func mustRewrite(t *testing.T, body string) string {
 	t.Helper()
-	out, changed := rewrite([]byte(body), tokyo)
+	return mustRewriteWith(t, body, tokyo)
+}
+
+func mustRewriteWith(t *testing.T, body string, c tzContext) string {
+	t.Helper()
+	out, changed := rewrite([]byte(body), c)
 	if !changed {
 		t.Fatalf("expected a rewrite, got none for %s", body)
 	}
@@ -27,6 +33,16 @@ func mustNotChange(t *testing.T, body string) {
 	if out, changed := rewrite([]byte(body), tokyo); changed || string(out) != body {
 		t.Fatalf("expected no change, got %s", out)
 	}
+}
+
+// item builds an input item with one text part; kinds is the raw content_item_kinds JSON, or empty for no metadata.
+func item(role, typ, text, kinds string) string {
+	t, _ := json.Marshal(text)
+	meta := ""
+	if kinds != "" {
+		meta = `,"internal_chat_message_metadata_passthrough":{"content_item_kinds":` + kinds + `}`
+	}
+	return `{"role":"` + role + `","content":[{"type":"` + typ + `","text":` + string(t) + `}]` + meta + `}`
 }
 
 func TestInjectInstructionsString(t *testing.T) {
@@ -95,26 +111,76 @@ func TestEnvBlockReplacedInPlaceWithoutInjection(t *testing.T) {
 	mustNotChange(t, out)
 }
 
-func TestEnvBlockMissingAndSelfClosingFields(t *testing.T) {
-	out := mustRewrite(t, `{"input":"<environment_context><cwd>/w</cwd><timezone/></environment_context>"}`)
-	text := gjson.Get(out, "input").String()
-	if !strings.Contains(text, "<timezone>Asia/Tokyo</timezone>") || !strings.Contains(text, "<current_date>2026-10-21</current_date>") || strings.Contains(text, "<timezone/>") {
+func TestEnvBlockExpandsSelfClosingAndAppendsNothing(t *testing.T) {
+	out := mustRewrite(t, `{"input":[`+item("user", "input_text", "<environment_context><cwd>/w</cwd><timezone/></environment_context>", "")+`]}`)
+	text := gjson.Get(out, "input.0.content.0.text").String()
+	if !strings.Contains(text, "<timezone>Asia/Tokyo</timezone>") || strings.Contains(text, "<timezone/>") || strings.Contains(text, "current_date") {
 		t.Fatalf("unexpected block: %q", text)
 	}
 }
 
-func TestEnvBlockCaseMultipleAndEscapedBrackets(t *testing.T) {
-	// < is how some serializers escape "<"; gjson decodes it before matching.
-	body := `{"instructions":"<ENVIRONMENT_CONTEXT><TimeZone>UTC</TimeZone></ENVIRONMENT_CONTEXT>","system":"<environment_context><timezone>UTC</timezone></environment_context>"}`
-	out := mustRewrite(t, body)
-	for _, p := range []string{"instructions", "system"} {
-		if got := gjson.Get(out, p).String(); !strings.Contains(got, "<timezone>Asia/Tokyo</timezone>") && !strings.Contains(got, ">Asia/Tokyo</") {
-			t.Fatalf("%s not rewritten: %q", p, got)
+const desktopBlock = "<codex_apps_client_time_context>\n  <timezone>Asia/Singapore</timezone>\n  <current_date>2026-10-20</current_date>\n  Use this client time context for user-facing dates.\n</codex_apps_client_time_context>"
+
+func TestDesktopTimeContextAlignedWithEnvironmentContext(t *testing.T) {
+	env := item("user", "input_text", "<environment_context><timezone>UTC</timezone></environment_context>", "")
+	for _, kinds := range []string{"", `["developer.text","additional_content.codex_apps_client_time_context"]`} {
+		dev := `{"role":"developer","content":[{"type":"input_text","text":"Keep Asia/Singapore in this instruction"},{"type":"input_text","text":` + jsonString(desktopBlock) + `}]`
+		if kinds != "" {
+			dev += `,"internal_chat_message_metadata_passthrough":{"content_item_kinds":` + kinds + `}`
 		}
+		out := mustRewrite(t, `{"input":[`+env+`,`+dev+`}]}`)
+		if got := gjson.Get(out, "input.1.content.0.text").String(); got != "Keep Asia/Singapore in this instruction" {
+			t.Fatalf("kinds=%q: other text changed: %q", kinds, got)
+		}
+		block := gjson.Get(out, "input.1.content.1.text").String()
+		want := strings.NewReplacer("Asia/Singapore", "Asia/Tokyo", "2026-10-20", "2026-10-21").Replace(desktopBlock)
+		if block != want {
+			t.Fatalf("kinds=%q: desktop block\n got %q\nwant %q", kinds, block, want)
+		}
+		if got := gjson.Get(out, "input.0.content.0.text").String(); !strings.Contains(got, "Asia/Tokyo") {
+			t.Fatalf("kinds=%q: environment block not aligned: %q", kinds, got)
+		}
+		if strings.Contains(out, marker) {
+			t.Fatalf("must not inject when blocks exist: %s", out)
+		}
+		mustNotChange(t, out)
 	}
-	two := mustRewrite(t, `{"input":"<environment_context></environment_context> and <environment_context></environment_context>"}`)
-	if n := strings.Count(gjson.Get(two, "input").String(), "Asia/Tokyo"); n != 2 {
-		t.Fatalf("want both blocks rewritten, got %d: %s", n, two)
+}
+
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func TestTimeContextOutsideStrictShapeIsLeftAlone(t *testing.T) {
+	env := "<environment_context><timezone>Asia/Singapore</timezone></environment_context>"
+	cases := map[string]string{
+		"desktop block under user role":     item("user", "input_text", desktopBlock, ""),
+		"environment block under developer": item("developer", "input_text", env, ""),
+		"assistant output":                  item("assistant", "output_text", env, ""),
+		"output_text under user":            item("user", "output_text", env, ""),
+		"tool output":                       `{"type":"function_call_output","call_id":"c","output":` + jsonString(env) + `}`,
+		"string content":                    `{"role":"user","content":` + jsonString(env) + `}`,
+		"explicit plain text":               item("user", "input_text", env, `["user.text"]`),
+		"unknown kind":                      item("user", "input_text", env, `["future.context"]`),
+		"empty kinds":                       item("user", "input_text", env, `[]`),
+		"text before block":                 item("user", "input_text", "Example:\n"+env, ""),
+		"text after block":                  item("user", "input_text", env+"\nKeep this example", ""),
+		"mismatched close tag":              item("user", "input_text", "<environment_context><timezone>Asia/Singapore</environment_context>", ""),
+		"unclosed block":                    item("user", "input_text", "<environment_context><timezone>Asia/Singapore</timezone>", ""),
+		"tag case differs":                  item("user", "input_text", "<ENVIRONMENT_CONTEXT><timezone>Asia/Singapore</timezone></ENVIRONMENT_CONTEXT>", ""),
+		"nested fields":                     item("user", "input_text", "<environment_context><example><timezone>Asia/Singapore</timezone></example></environment_context>", ""),
+		"two blocks in one text":            item("user", "input_text", env+env, ""),
+	}
+	for name, it := range cases {
+		body := `{"input":[` + it + `]}`
+		out := mustRewrite(t, body) // nothing recognised, so only the marker text is injected
+		if gjson.Get(out, "input").Raw != gjson.Get(body, "input").Raw {
+			t.Errorf("%s: input was modified: %s", name, out)
+		}
+		if !strings.Contains(gjson.Get(out, "instructions").String(), marker) {
+			t.Errorf("%s: expected the marker text to be injected: %s", name, out)
+		}
 	}
 }
 
@@ -129,6 +195,27 @@ func TestAssistantAndToolOutputUntouched(t *testing.T) {
 
 func TestToolsFieldIgnored(t *testing.T) {
 	mustNotChange(t, `{"instructions":"x [CODEX_TIMEZONE_V1]","tools":[{"description":"<environment_context><timezone>UTC</timezone></environment_context>"}]}`)
+}
+
+func TestWebSearchLocationAligned(t *testing.T) {
+	c := tokyo
+	c.userLocation = (&zoneState{name: "Asia/Tokyo", country: "JP"}).searchLocation()
+	const keep = `{"type":"function","name":"keep","description":"Keep Asia/Shanghai unchanged","user_location":{"country":"US"}}`
+	body := `{"instructions":"x ` + marker + `","tools":[{"type":"web_search","user_location":{"type":"approximate","country":"US","city":"Piketon","timezone":"America/New_York"}},{"type":"web_search_preview"},` + keep + `]}`
+	out := mustRewriteWith(t, body, c)
+	for _, i := range []string{"0", "1"} {
+		loc := gjson.Get(out, "tools."+i+".user_location")
+		if loc.Get("country").String() != "JP" || loc.Get("city").String() != "Tokyo" || loc.Get("timezone").String() != "Asia/Tokyo" || loc.Get("type").String() != "approximate" || loc.Get("region").Exists() {
+			t.Fatalf("tools.%s.user_location: %s", i, loc.Raw)
+		}
+	}
+	if gjson.Get(out, "tools.2").Raw != keep {
+		t.Fatalf("non web_search tool was modified: %s", out)
+	}
+	if again, changed := rewrite([]byte(out), c); changed {
+		t.Fatalf("second pass must not change anything: %s", again)
+	}
+	mustNotChange(t, body) // no location configured: tools stay as they are
 }
 
 func TestClockUsesZoneRulesAtGivenInstant(t *testing.T) {
